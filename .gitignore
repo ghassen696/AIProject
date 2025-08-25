@@ -1,0 +1,9 @@
+# Ignore local databases and build artifacts
+rag_pipeline/chroma_db/
+PythonStreamlit/chroma_db/
+*.sqlite3
+*.bin
+build/
+dist/
+venv/
+*.log 
