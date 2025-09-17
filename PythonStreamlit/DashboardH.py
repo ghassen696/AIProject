@@ -1,605 +1,495 @@
 import streamlit as st
 import pandas as pd
+from dashboard_utils import (
+    ElasticsearchConnector, 
+    DataProcessor, 
+    ChartGenerator, 
+    create_sidebar_filters
+)
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-from elasticsearch import Elasticsearch
-from config import ELASTICSEARCH_URL
-import io, subprocess, sys
-import numpy as np
-es = Elasticsearch(ELASTICSEARCH_URL, verify_certs=False)
-# Color scheme constants
-COLORS = {
-    'productive': '#2E8B57', 
-    'idle': '#DC143C',       
-    'pause': '#FF8C00',       
-    'apps': '#4169E1',       
-    'neutral': '#696969',      
-    'success': '#32CD32',     
-    'warning': '#FFD700'     
-}
 
-def get_employee_data(index="employee_activity", start_date=None, end_date=None, batch_size=5000):
-    must = [{"match_all": {}}]
-    if start_date and end_date:
-        must.append({"range": {"timestamp": {"gte": start_date.isoformat(), "lte": end_date.isoformat()}}})
-    query = {"bool": {"must": must}}
+import asyncio
+from test.Daily_Work_Alignment import match_tasks_to_activities, read_tasks_from_list
 
-    res = es.search(index=index, query=query, size=batch_size, scroll="2m")
-    scroll_id = res.get("_scroll_id")
-    records = [hit["_source"] for hit in res["hits"]["hits"]]
-    while True:
-        res = es.scroll(scroll_id=scroll_id, scroll="2m")
-        hits = res["hits"]["hits"]
-        if not hits: break
-        records.extend([hit["_source"] for hit in hits])
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        if "duration_sec" in df.columns and "idle_duration_sec" not in df.columns:
-            df.rename(columns={"duration_sec": "idle_duration_sec"}, inplace=True)
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.sort_values("timestamp")
-    return df
-
-def _fetch_unique_terms(index_name, field, size=1000):
-    body = {"size":0,"aggs":{"unique_values":{"terms":{"field":field,"size":size}}}}
+def main():
+    # Header
+    st.markdown('<h1 class="main-header">📊 Employee Productivity Dashboard</h1>', unsafe_allow_html=True)
+    
+    # Initialize Elasticsearch connector
     try:
-        res = es.search(index=index_name, body=body)
-        buckets = res.get("aggregations", {}).get("unique_values", {}).get("buckets", [])
-        return [b["key"] for b in buckets]
+        es_connector = ElasticsearchConnector()
     except Exception as e:
-        st.error(f"Error fetching unique terms for field '{field}': {e}")
-        return []
+        st.error(f"❌ Failed to connect to Elasticsearch: {str(e)}")
+        st.stop()
+    
+    # Sidebar filters
+    # Sidebar filters
+    start_date, end_date, all_selected_employees = create_sidebar_filters(es_connector)
 
-def _read_index(index, query, size=2000):
-    try:
-        res = es.search(index=index, query=query, size=size)
-        return [h["_source"] for h in res["hits"]["hits"]]
-    except Exception as e:
-        st.error(f"Error reading index {index}: {e}")
-        return []
-
-def get_daily_metrics(employee_ids, start_date, end_date):
-    query = {
-        "bool": {
-            "must": [
-                {"terms": {"employee_id": employee_ids}},
-                {"range": {"date": {"gte": start_date.isoformat(), "lte": end_date.isoformat()}}}
-            ]
-        }
-    }
-    res = es.search(index="employee_daily_summaries", query=query, size=5000)
-    records = [h["_source"] for h in res["hits"]["hits"]]
-    return pd.DataFrame(records)
-
-def get_daily_reports(employee_id, start_date, end_date):
-    query = {
-        "bool": {
-            "must": [
-                {"term": {"employee_id": employee_id}},
-                {"range": {"date": {"gte": start_date.isoformat(), "lte": end_date.isoformat()}}}
-            ]
-        }
-    }
-    res = es.search(index="employee_daily_reports", query=query, size=100)
-    return {h["_source"]["date"]: h["_source"]["daily_summary"] for h in res["hits"]["hits"]}
-
-def calculate_productivity_score(df):
-    """Calculate a comprehensive productivity score based on multiple factors"""
-    if df.empty:
-        return 0
-    
-    # Base metrics
-    total_idle = df["idle_duration_sec"].fillna(0).sum()
-    total_pause = df["duration_minutes"].fillna(0).sum() * 60
-    total_keystrokes = df[df["event"] == "keystrokes"].shape[0]
-    window_switches = df[df["event"] == "window_switch"].shape[0]
-    
-    # Time calculations
-    session_duration = (df["timestamp"].max() - df["timestamp"].min()).total_seconds()
-    active_time = max(session_duration - total_idle - total_pause, 0)
-    
-    # Scoring factors (0-100 scale)
-    focus_score = max(0, 100 - (total_idle / max(session_duration, 1)) * 100)
-    activity_score = min(100, (total_keystrokes / max(active_time / 60, 1)) * 10)
-    consistency_score = max(0, 100 - (window_switches / max(active_time / 60, 1)) * 5)
-    
-    # Weighted average
-    productivity_score = (focus_score * 0.4 + activity_score * 0.4 + consistency_score * 0.2)
-    return min(100, max(0, productivity_score))
-
-def detect_anomalies(df, employee_id):
-    """Detect anomalies in employee activity patterns"""
-    if df.empty:
-        return []
-    
-    anomalies = []
-    
-    # Calculate daily statistics
-    df['date'] = df['timestamp'].dt.date
-    daily_stats = df.groupby('date').agg({
-        'idle_duration_sec': 'sum',
-        'duration_minutes': 'sum',
-        'event': 'count'
-    }).reset_index()
-    
-    if len(daily_stats) < 2:
-        return anomalies
-    
-    # Detect unusual idle time (more than 2 standard deviations from mean)
-    idle_mean = daily_stats['idle_duration_sec'].mean()
-    idle_std = daily_stats['idle_duration_sec'].std()
-    if idle_std > 0:
-        high_idle_days = daily_stats[daily_stats['idle_duration_sec'] > idle_mean + 2*idle_std]
-        for _, row in high_idle_days.iterrows():
-            anomalies.append({
-                'type': 'High Idle Time',
-                'date': row['date'],
-                'value': f"{row['idle_duration_sec']/3600:.1f}h",
-                'severity': 'warning'
-            })
-    
-    # Detect unusually low activity days
-    activity_mean = daily_stats['event'].mean()
-    activity_std = daily_stats['event'].std()
-    if activity_std > 0:
-        low_activity_days = daily_stats[daily_stats['event'] < activity_mean - 2*activity_std]
-        for _, row in low_activity_days.iterrows():
-            anomalies.append({
-                'type': 'Low Activity',
-                'date': row['date'],
-                'value': f"{row['event']} events",
-                'severity': 'warning'
-            })
-    
-    return anomalies
-
-def create_trend_chart(df, metric, title, color):
-    """Create a trend chart for a specific metric over time"""
-    if df.empty:
-        return None
-    
-    df_copy = df.copy()
-    df_copy['date'] = df_copy['timestamp'].dt.date
-    
-    if metric == 'keystrokes':
-        daily_data = df_copy[df_copy['event'] == 'keystrokes'].groupby('date').size().reset_index()
-        daily_data.columns = ['date', 'count']
-        y_col = 'count'
-        y_title = 'Keystrokes'
-    elif metric == 'idle_time':
-        daily_data = df_copy.groupby('date')['idle_duration_sec'].sum().reset_index()
-        daily_data['hours'] = daily_data['idle_duration_sec'] / 3600
-        y_col = 'hours'
-        y_title = 'Idle Time (hours)'
-    elif metric == 'app_switches':
-        daily_data = df_copy[df_copy['event'] == 'window_switch'].groupby('date').size().reset_index()
-        daily_data.columns = ['date', 'count']
-        y_col = 'count'
-        y_title = 'Window Switches'
+    # Role-based filtering
+    if st.session_state.role == "admin":
+        selected_employees = all_selected_employees  # admin sees all selected employees
     else:
-        return None
+        selected_employees = [st.session_state.employee_id]  # regular user sees only their own data
+
     
-    if daily_data.empty:
-        return None
-    
-    fig = px.line(daily_data, x='date', y=y_col, 
-                   title=title, color_discrete_sequence=[color])
-    fig.update_layout(
-        xaxis_title="Date",
-        yaxis_title=y_title,
-        showlegend=False,
-        height=300
-    )
-    return fig
-
-def dashboard_page():
-    st.set_page_config(page_title="Employee Activity Dashboard", layout="wide")
-    
-    # Custom CSS for better styling
-    st.markdown("""
-    <style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1f77b4;
-    }
-    .anomaly-warning {
-        background-color: #fff3cd;
-        border: 1px solid #ffeaa7;
-        padding: 0.5rem;
-        border-radius: 0.25rem;
-        margin: 0.5rem 0;
-    }
-    .anomaly-danger {
-        background-color: #f8d7da;
-        border: 1px solid #f5c6cb;
-        padding: 0.5rem;
-        border-radius: 0.25rem;
-        margin: 0.5rem 0;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    st.title("📊 Employee Activity Monitoring Dashboard")
-    st.markdown("---")
-
-    # Sidebar with enhanced filters
-    with st.sidebar:
-        st.header("🔎 Dashboard Filters")
-        
-        # Date range filter
-        st.subheader("📅 Date Range")
-        date_range = st.date_input(
-            "Select Date Range", 
-            [datetime.now() - timedelta(days=7), datetime.now()],
-            help="Choose the date range for analysis"
-        )
-        
-        # Employee filter
-        st.subheader("👤 Employee Selection")
-        if "employee_ids" not in st.session_state:
-            st.session_state["employee_ids"] = _fetch_unique_terms("employee_activity", "employee_id")
-        
-        employee_ids = st.session_state["employee_ids"]
-        selected_employees = st.multiselect(
-            "Select Employees", 
-            options=employee_ids, 
-            default=employee_ids[:3] if len(employee_ids) >= 3 else employee_ids,
-            help="Select one or more employees to analyze"
-        )
-        
-        # Application filter
-        st.subheader("💻 Application Filter")
-        if selected_employees:
-            df_temp = get_employee_data(start_date=date_range[0], end_date=date_range[1])
-            df_temp = df_temp[df_temp["employee_id"].isin(selected_employees)]
-            available_apps = df_temp["application"].dropna().unique()
-            selected_apps = st.multiselect(
-                "Filter by Applications",
-                options=available_apps,
-                default=available_apps[:5] if len(available_apps) >= 5 else available_apps,
-                help="Select specific applications to focus on"
-            )
-        else:
-            selected_apps = []
-        
-        st.markdown("---")
-        
-        # Workload upload section
-        st.subheader("📂 Workload Management")
-        up = st.file_uploader("Upload Workload", type=["txt","csv","md"])
-        if up is not None:
-            try:
-                if up.type.startswith("text/") or up.name.endswith((".txt",".md",".csv")):
-                    content = up.read().decode("utf-8", errors="ignore")
-                    es.index(index="workloads", document={
-                        "manager_id": "manager1",
-                        "team": "default",
-                        "timestamp": datetime.utcnow(),
-                        "workload_text": content
-                    })
-                    st.success("✅ Workload uploaded successfully!")
-                else:
-                    st.warning("⚠️ Only txt/csv/md files supported")
-            except Exception as e:
-                st.error(f"❌ Upload failed: {e}")
-        
-        # Batch jobs section
-        st.subheader("🛠️ Batch Operations")
-        col1, col2 = st.columns(2)
-        if col1.button("📊 Daily Pipeline", help="Run daily summarization"):
-            try:
-                out = subprocess.run([sys.executable, "jobs/daily_pipeline.py"], 
-                                   capture_output=True, text=True)
-                if out.returncode == 0:
-                    st.success("✅ Pipeline completed")
-                else:
-                    st.error(f"❌ Pipeline failed: {out.stderr}")
-            except Exception as e:
-                st.error(f"❌ Failed: {e}")
-                
-        if col2.button("🔍 Workload Match", help="Run workload matching"):
-            try:
-                out = subprocess.run([sys.executable, "jobs/workload_match.py"], 
-                                   capture_output=True, text=True)
-                if out.returncode == 0:
-                    st.success("✅ Workload matching completed")
-                else:
-                    st.error(f"❌ Workload matching failed: {out.stderr}")
-            except Exception as e:
-                st.error(f"❌ Failed: {e}")
-
-    # Main dashboard content
-    if not selected_employees:
-        st.warning("⚠️ Please select at least one employee from the sidebar to view the dashboard.")
-        return
-
-    # Load and filter data
-    df = get_employee_data(start_date=date_range[0], end_date=date_range[1])
-    if df.empty:
-        st.warning("⚠️ No data found for the selected date range.")
-        return
-
-    # Apply filters
-    df = df[df["employee_id"].isin(selected_employees)]
-    if selected_apps:
-        df = df[df["application"].isin(selected_apps)]
-
-    # Employee selector for detailed view
-    if len(selected_employees) > 1:
-        selected_employee = st.selectbox(
-            "👤 Select Employee for Detailed View", 
-            options=selected_employees,
-            help="Choose an employee to see detailed metrics and insights"
-        )
-        df_employee = df[df["employee_id"] == selected_employee]
+    # Display selected filters
+    if selected_employees:
+        st.info(f"📅 **Period:** {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} | "
+                f"👥 **Employees:** {len(selected_employees)} selected")
     else:
-        selected_employee = selected_employees[0]
-        df_employee = df
+        st.warning("Please select at least one employee to view data")
+        st.stop()
+    
+    # Create tabs for different sections
+    tab1, tab2, tab3,tab4,tab5  = st.tabs([
+        "⏱️ Realtime Dashboard",
+        "📈 Overview", 
+        "📋 Daily Reports", 
+        "🔍 Insights Reports",
+        "Work Allignement"
+        
 
-    # Calculate metrics
-    total_idle = df_employee["idle_duration_sec"].fillna(0).sum()
-    total_pause = df_employee["duration_minutes"].fillna(0).sum() * 60
-    total_keystrokes = df_employee[df_employee["event"] == "keystrokes"].shape[0]
-    total_chars = df_employee[df_employee["event"] == "keystrokes"]["text"].dropna().astype(str).str.len().sum()
-    apps_used = df_employee["application"].dropna().nunique()
-    window_switches = df_employee[df_employee["event"] == "window_switch"].shape[0]
-    corrections = df_employee[df_employee["event"] == "keystrokes"]["text"].dropna().astype(str).str.count("<Key.backspace>").sum()
-    
-    session_duration = (df_employee["timestamp"].max() - df_employee["timestamp"].min()).total_seconds()
-    active_time = max(session_duration - total_idle - total_pause, 0)
-    focus_ratio = (active_time / max(session_duration, 1)) * 100
-    keystrokes_per_min = total_keystrokes / (active_time / 60) if active_time > 0 else 0
-    typing_speed = total_chars / (active_time / 60) if active_time > 0 else 0
-    task_switch_rate = window_switches / (active_time / 60) if active_time > 0 else 0
-    typing_correction_rate = (corrections / max(total_keystrokes, 1)) * 100
-    
-    # Calculate productivity score
-    productivity_score = calculate_productivity_score(df_employee)
-    
-    # Detect anomalies
-    anomalies = detect_anomalies(df_employee, selected_employee)
-
-    # Header with summary
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        st.subheader(f"📊 Activity Summary for {selected_employee}")
-        st.caption(f"Period: {date_range[0]} to {date_range[1]}")
-    
-    with col2:
-        st.metric("📈 Productivity Score", f"{productivity_score:.1f}%")
-    
-    with col3:
-        if anomalies:
-            st.metric("⚠️ Anomalies Detected", len(anomalies))
-        else:
-            st.metric("✅ No Anomalies", "Clean")
-
-    # Key Performance Indicators
-    st.subheader("🎯 Key Performance Indicators")
-    
-    # Row 1: Time-based metrics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(
-            "⏱️ Active Time", 
-            f"{active_time/3600:.2f}h",
-            f"{focus_ratio:.1f}% focus",
-            delta_color="normal"
-        )
-    
-    with col2:
-        st.metric(
-            "🕑 Idle Time", 
-            f"{total_idle/3600:.2f}h",
-            f"{(total_idle/session_duration*100):.1f}% of session",
-            delta_color="inverse"
-        )
-    
-    with col3:
-        st.metric(
-            "⏸️ Pause Time", 
-            f"{total_pause/3600:.2f}h",
-            f"{(total_pause/session_duration*100):.1f}% of session",
-            delta_color="inverse"
-        )
-    
-    with col4:
-        st.metric(
-            "📅 Session Duration", 
-            f"{session_duration/3600:.2f}h",
-            f"Total time tracked",
-            delta_color="normal"
-        )
-
-    # Row 2: Productivity metrics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(
-            "⌨️ Keystrokes", 
-            f"{total_keystrokes:,}",
-            f"{keystrokes_per_min:.1f}/min",
-            delta_color="normal"
-        )
-    
-    with col2:
-        st.metric(
-            "✍️ Typing Speed", 
-            f"{typing_speed:.1f} chars/min",
-            f"{total_chars:,} total chars",
-            delta_color="normal"
-        )
-    
-    with col3:
-        st.metric(
-            "🔄 Task Switches", 
-            f"{window_switches}",
-            f"{task_switch_rate:.2f}/min",
-            delta_color="inverse"
-        )
-    
-    with col4:
-        st.metric(
-            "✏️ Corrections", 
-            f"{corrections}",
-            f"{typing_correction_rate:.1f}% rate",
-            delta_color="inverse"
-        )
-
-    # Anomalies section
-    if anomalies:
-        st.subheader("⚠️ Activity Anomalies Detected")
-        for anomaly in anomalies:
-            severity_class = "anomaly-danger" if anomaly['severity'] == 'danger' else "anomaly-warning"
-            st.markdown(f"""
-            <div class="{severity_class}">
-                <strong>{anomaly['type']}</strong> on {anomaly['date']}: {anomaly['value']}
-            </div>
-            """, unsafe_allow_html=True)
-
-    # Visualizations section
-    st.subheader("📊 Activity Visualizations")
-    
-    # Create tabs for different chart types
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Trends", "⏰ Time Distribution", "💻 App Usage", "📊 Activity Breakdown"])
-    
+    ])
     with tab1:
-        st.subheader("📈 Activity Trends Over Time")
-        
-        # Create trend charts
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            keystrokes_fig = create_trend_chart(df_employee, 'keystrokes', 'Daily Keystrokes Trend', COLORS['productive'])
-            if keystrokes_fig:
-                st.plotly_chart(keystrokes_fig, use_container_width=True)
-            else:
-                st.info("No keystroke data available for trend analysis")
-        
-        with col2:
-            idle_fig = create_trend_chart(df_employee, 'idle_time', 'Daily Idle Time Trend', COLORS['idle'])
-            if idle_fig:
-                st.plotly_chart(idle_fig, use_container_width=True)
-            else:
-                st.info("No idle time data available for trend analysis")
-        
-        # App switching trend
-        app_switch_fig = create_trend_chart(df_employee, 'app_switches', 'Daily Window Switching Trend', COLORS['apps'])
-        if app_switch_fig:
-            st.plotly_chart(app_switch_fig, use_container_width=True)
-    
+        show_realtime_dashboard_tab(es_connector, selected_employees)
+
     with tab2:
-        st.subheader("⏰ Time Distribution Analysis")
-        
-        # Time breakdown pie chart
-        time_breakdown = pd.DataFrame({
-            "State": ["Active", "Idle", "Pause"],
-            "Hours": [active_time/3600, total_idle/3600, total_pause/3600],
-            "Color": [COLORS['productive'], COLORS['idle'], COLORS['pause']]
-        })
-        
-        fig_pie = px.pie(
-            time_breakdown, 
-            values="Hours", 
-            names="State",
-            title="Session Time Distribution",
-            color_discrete_sequence=[COLORS['productive'], COLORS['idle'], COLORS['pause']]
-        )
-        fig_pie.update_layout(height=400)
-        st.plotly_chart(fig_pie, use_container_width=True)
-        
-        # Hourly activity heatmap
-        if not df_employee.empty:
-            df_employee['hour'] = df_employee['timestamp'].dt.hour
-            hourly_activity = df_employee.groupby('hour').size().reset_index()
-            hourly_activity.columns = ['Hour', 'Activity Count']
-            
-            fig_heatmap = px.bar(
-                hourly_activity, 
-                x='Hour', 
-                y='Activity Count',
-                title="Hourly Activity Pattern",
-                color_discrete_sequence=[COLORS['apps']]
-            )
-            fig_heatmap.update_layout(height=300)
-            st.plotly_chart(fig_heatmap, use_container_width=True)
+        show_overview_tab(es_connector, selected_employees, start_date, end_date)
+        show_kpi_summary_tab(es_connector, selected_employees, start_date, end_date)
+
     
     with tab3:
-        st.subheader("💻 Application Usage Analysis")
-        
-        # Top applications used
-        app_counts = df_employee["application"].value_counts().head(10).reset_index()
-        app_counts.columns = ["Application", "Usage Count"]
-        
-        if not app_counts.empty:
-            fig_apps = px.bar(
-                app_counts, 
-                x="Application", 
-                y="Usage Count",
-                title="Top 10 Applications Used",
-                color_discrete_sequence=[COLORS['apps']]
-            )
-            fig_apps.update_layout(height=400)
-            fig_apps.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_apps, use_container_width=True)
-            
-            # Application usage by time
-            if 'duration_minutes' in df_employee.columns:
-                app_time = df_employee.groupby('application')['duration_minutes'].sum().reset_index()
-                app_time = app_time.sort_values('duration_minutes', ascending=False).head(10)
-                
-                fig_app_time = px.bar(
-                    app_time,
-                    x='application',
-                    y='duration_minutes',
-                    title="Application Usage by Time (Minutes)",
-                    color_discrete_sequence=[COLORS['productive']]
-                )
-                fig_app_time.update_layout(height=400)
-                fig_app_time.update_xaxes(tickangle=45)
-                st.plotly_chart(fig_app_time, use_container_width=True)
-        else:
-            st.info("No application usage data available")
-    
+        show_daily_reports_tab(es_connector, selected_employees, start_date, end_date)
+        show_work_distribution_tab(es_connector, selected_employees, start_date, end_date)
+
     with tab4:
-        st.subheader("📊 Detailed Activity Breakdown")
-        
-        # Event timeline
-        if not df_employee.empty:
-            fig_timeline = px.scatter(
-                df_employee, 
-                x="timestamp", 
-                y="event", 
-                color="event",
-                hover_data=["application", "window", "text"],
-                title="Activity Timeline - Events Over Time",
-                color_discrete_sequence=[COLORS['productive'], COLORS['apps'], COLORS['idle'], COLORS['pause']]
+            st.header("test")
+    with tab5:
+        st.header("📝 Work Alignment")
+
+        # Employee & date selection
+        employee_id = st.selectbox("Select Employee", selected_employees)
+        start_date_input = st.date_input("Start Date", start_date)
+        end_date_input = st.date_input("End Date", end_date)
+
+        # Task input method
+        task_input_method = st.radio("Input Tasks", ["Manual Entry", "Upload Excel"])
+        tasks = []
+
+        if task_input_method == "Manual Entry":
+            task_text = st.text_area(
+                "Enter tasks (one per line, format: description; ddl: m/d/Y; priority: high/medium/low; notes: ...)"
             )
-            fig_timeline.update_layout(height=400)
-            st.plotly_chart(fig_timeline, use_container_width=True)
-        
-        # Daily activity breakdown
-        daily_metrics = get_daily_metrics([selected_employee], date_range[0], date_range[1])
-        if not daily_metrics.empty and "summary" in daily_metrics.columns:
-            st.subheader("📄 Daily Activity Summaries")
-            for _, row in daily_metrics.sort_values(["date","chunk_index"]).iterrows():
-                with st.expander(f"📅 {row['date']} - Chunk {row['chunk_index']}"):
-                    st.write(row['summary'])
+            if task_text:
+                tasks = read_tasks_from_list(task_text.split("\n"))
         else:
-            st.info("⚠️ No daily summaries available for this employee in the selected range")
+            task_file = st.file_uploader("Upload Excel file with 'task_description' column", type=["xlsx"])
+            if task_file:
+                df_tasks = pd.read_excel(task_file)
+                tasks = df_tasks["task_description"].dropna().tolist()
 
+        # Run alignment button
+        if tasks and st.button("🔎 Match Tasks to Activities"):
+            with st.spinner("Matching tasks to activities..."):
+                result = run_task_alignment(
+                    es_connector.es,
+                    employee_id,
+                    start_date_input,
+                    end_date_input,
+                    tasks
+                )
 
-    # Raw data section (collapsible)
-    with st.expander("🔍 View Raw Activity Data"):
-        st.subheader("📋 Latest Activity Events")
-        st.dataframe(
-            df_employee.sort_values("timestamp", ascending=False).head(20),
-            use_container_width=True
+            # Display results
+            st.subheader("✅ Task Matching Results")
+            for match in result["matches"]:
+                with st.expander(f"{match['task_description']}"):
+                    st.write(f"**Time Spent:** {match['time_spent_minutes']:.1f} min")
+                    st.write(f"**Match Score:** {match['match_score']:.2f}")
+                    st.write(f"**Reasoning:** {match['reasoning']}")
+
+            st.metric("Overall Productivity Score", f"{result['productivity_score']:.2f}")
+            st.metric("Completion Rate", f"{result['completion_rate']:.2f}")
+            st.metric("Time Efficiency", f"{result['time_efficiency']:.2f}")
+
+import streamlit as st
+import pandas as pd
+import time
+from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
+import plotly.express as px
+import plotly.graph_objects as go
+
+def show_realtime_dashboard_tab(es_connector, selected_employees):
+    st.header("⚡ Realtime Dashboard")
+    
+    # Auto-refresh every 30 seconds
+    st_autorefresh(interval=30_000, key="realtime_refresh")
+
+    # Elasticsearch query (today)
+    now_ms = int(time.time() * 1000)
+    start_of_today_ms = int(datetime.combine(datetime.today(), datetime.min.time()).timestamp() * 1000)
+
+    res = es_connector.es.search(
+        index="employee_kpi_daily_v1",
+        body={
+            "query": {
+                "range": {
+                    "date": {
+                        "gte": start_of_today_ms,
+                        "lte": now_ms
+                    }
+                }
+            },
+            "size": 100,
+            "sort": [{"last_event_time": {"order": "desc"}}]
+        }
+    )
+
+    hits = res.get("hits", {}).get("hits", [])
+    if not hits:
+        st.warning("No data available for today.")
+        return
+
+    # Convert to DataFrame
+    df = pd.DataFrame([hit["_source"] for hit in hits])
+    df["date"] = pd.to_datetime(df["date"], unit="ms")
+    df["last_event_time"] = pd.to_datetime(df["last_event_time"], unit="ms")
+
+    # Filter selected employees
+    if selected_employees:
+        df = df[df["employee_id"].isin(selected_employees)]
+
+    # ----------------- Basic Table -----------------
+    st.subheader("📋 Employee Status & Metrics")
+    st.dataframe(df[["employee_id", "employee_status", "keystrokes_today",
+                     "pauses_today", "total_pause_minutes_today", "last_event_time"]])
+
+    # ----------------- Status Summary -----------------
+    st.subheader("🟢 Employee Status Distribution")
+    status_counts = df["employee_status"].value_counts()
+    fig_status = px.pie(
+        names=status_counts.index, 
+        values=status_counts.values, 
+        hole=0.4, 
+        title="Employee Status"
+    )
+    st.plotly_chart(fig_status, use_container_width=True)
+
+    # ----------------- Keystrokes vs Pauses -----------------
+    st.subheader("⌨️ Keystrokes vs Pause Duration")
+    fig_kp = go.Figure()
+    fig_kp.add_trace(go.Bar(
+        x=df["employee_id"],
+        y=df["keystrokes_today"],
+        name="Keystrokes",
+        marker_color="green"
+    ))
+    fig_kp.add_trace(go.Bar(
+        x=df["employee_id"],
+        y=df["total_pause_minutes_today"],
+        name="Pause Minutes",
+        marker_color="red"
+    ))
+    fig_kp.update_layout(
+        barmode="group",
+        title="Keystrokes vs Pause Duration",
+        xaxis_title="Employee",
+        yaxis_title="Count / Minutes"
+    )
+    st.plotly_chart(fig_kp, use_container_width=True)
+
+    # ----------------- Events Heatmap -----------------
+    st.subheader("🔥 Event Type Frequency per Employee")
+    event_records = []
+    for _, row in df.iterrows():
+        for evt in row.get("events_today", []):
+            event_records.append({"employee_id": row["employee_id"], "event": evt})
+
+    if event_records:
+        df_events = pd.DataFrame(event_records)
+        event_pivot = pd.crosstab(df_events["employee_id"], df_events["event"])
+        fig_events = px.imshow(
+            event_pivot.values,
+            x=event_pivot.columns,
+            y=event_pivot.index,
+            color_continuous_scale="Viridis",
+            labels=dict(x="Event Type", y="Employee", color="Count"),
+            aspect="auto",
+            title="Event Heatmap per Employee"
         )
+        st.plotly_chart(fig_events, use_container_width=True)
+
+    # ----------------- Top Active Employees -----------------
+    st.subheader("🏆 Top Active Employees Today")
+    top_activity = df.sort_values("keystrokes_today", ascending=False).head(5)
+    fig_top = px.bar(
+        top_activity,
+        x="employee_id",
+        y="keystrokes_today",
+        text="keystrokes_today",
+        title="Top 5 Employees by Keystrokes Today",
+        color="employee_status",
+        color_discrete_map={"active": "green", "idle": "orange", "paused": "red"}
+    )
+    st.plotly_chart(fig_top, use_container_width=True)
+
+def run_task_alignment(es, employee_id: str, start_date, end_date, tasks: list) -> dict:
+    """
+    Run task-to-activity matching and return the result.
+    """
+    # Ensure dates are in string format
+    start_date_str = start_date.strftime("%Y-%m-%d") if hasattr(start_date, "strftime") else str(start_date)
+    end_date_str = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)
+
+    # Run the async matching
+    result = asyncio.run(match_tasks_to_activities(es, employee_id, start_date_str, end_date_str, tasks))
+    return result
+def show_kpi_summary_tab(es_connector, selected_employees, start_date, end_date):
+    # Fetch KPI data
+    kpi_data = es_connector.query_kpi_summary(
+        employee_ids=selected_employees,
+        start_date=start_date,
+        end_date=end_date
+    )
+    if not kpi_data:
+        st.warning("No KPI summary data available for the selection.")
+        return
+
+    kpi_df = pd.DataFrame(kpi_data)
+
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Total Keystrokes", f"{kpi_df['total_keystrokes'].sum():,}")
+    with col2:
+        st.metric("Avg Pause Duration (min)", f"{kpi_df['avg_pause_duration_min'].mean():.1f}")
+    with col3:
+        st.metric("Unique Apps", f"{int(kpi_df['unique_apps_count'].mean())}")
+    with col4:
+        st.metric("Event Types", f"{int(kpi_df['distinct_event_types'].mean())}")
+    with col5:
+        st.metric("Window Switches", f"{int(kpi_df['window_switch_count'].sum())}")
+
+    # 🔹 DONUT CHART (Active/Idle/Pause %)
+    st.subheader("⏱️ Activity Distribution")
+    if len(kpi_df["employee_id"].unique()) == 1:
+        row = kpi_df.iloc[0]
+        labels = ["Active %", "Idle %", "Pause %"]
+        if "active_pct" in row and "idle_pct" in row and "pause_pct" in row:
+            values = [row["active_pct"], row["idle_pct"], row["pause_pct"]]
+        else:
+            total_sec = row.get("total_sec", 1)  # avoid division by zero
+            values = [
+                row.get("active_sec", 0) / total_sec * 100,
+                row.get("idle_sec", 0) / total_sec * 100,
+                row.get("pause_sec", 0) / total_sec * 100
+            ]
+        fig = px.pie(names=labels, values=values, hole=0.4,
+                     title=f"Activity Breakdown - {row['employee_id']}")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        weights = kpi_df["total_sec"]
+        active = (kpi_df["active_pct"] * weights).sum() / weights.sum()
+        idle = (kpi_df["idle_pct"] * weights).sum() / weights.sum()
+        pause = (kpi_df["pause_pct"] * weights).sum() / weights.sum()
+        labels = ["Active %", "Idle %", "Pause %"]
+        values = [active, idle, pause]
+        fig = px.pie(names=labels, values=values, hole=0.4,
+                     title="Global Team Activity Breakdown")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 🔹 TYPING PER HOUR
+    st.subheader("⌨️ Typing Per Hour")
+    typing_data = []
+    for _, row in kpi_df.iterrows():
+        for item in row.get("typing_per_hour", []):
+            typing_data.append({
+                "employee_id": row["employee_id"],
+                "hour": item["hour"],
+                "chars_per_hour": item["chars_per_hour"]
+            })
+    if typing_data:
+        typing_df = pd.DataFrame(typing_data)
+        fig = px.bar(typing_df, x="hour", y="chars_per_hour",
+                     color="employee_id", barmode="group",
+                     title="Typing Activity per Hour")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 🔹 KEYSTROKES PER ACTIVE EVENT
+    st.subheader("📈 Keystrokes per Active Event (Efficiency)")
+    keystroke_eff = []
+    for _, row in kpi_df.iterrows():
+        for item in row.get("keystrokes_per_active_hour", []):
+            keystroke_eff.append({
+                "employee_id": row["employee_id"],
+                "hour": item["hour"],
+                "keystrokes_per_active_event": item["keystrokes_per_active_event"]
+            })
+    if keystroke_eff:
+        eff_df = pd.DataFrame(keystroke_eff)
+        fig = px.line(eff_df, x="hour", y="keystrokes_per_active_event",
+                      color="employee_id", markers=True,
+                      title="Keystrokes per Active Event Over Time")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 🔹 APP USAGE PER HOUR
+    st.subheader("🖥️ App Usage Per Hour")
+    app_usage = []
+    for _, row in kpi_df.iterrows():
+        for item in row.get("app_usage_per_hour", []):
+            app_usage.append({
+                "employee_id": row["employee_id"],
+                "application": item["application"],
+                "hour": item["hour"],
+                "events_per_hour": item["events_per_hour"]
+            })
+    if app_usage:
+        app_df = pd.DataFrame(app_usage)
+        fig = px.bar(app_df, x="hour", y="events_per_hour",
+                     color="application", facet_col="employee_id",
+                     barmode="stack", title="Application Events per Hour")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 🔹 TOP WINDOWS
+    st.subheader("🪟 Top Windows by Switch Count")
+    windows = []
+    for _, row in kpi_df.iterrows():
+        for item in row.get("top_windows", []):
+            windows.append({
+                "employee_id": row["employee_id"],
+                "window": item.get("window", "Unknown"),
+                "switch_count": item["switch_count"]
+            })
+    if windows:
+        win_df = pd.DataFrame(windows)
+        fig = px.bar(win_df, x="switch_count", y="window",
+                     color="employee_id", orientation="h",
+                     title="Most Frequent Windows")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 🔹 SESSION BREAKDOWN
+    st.subheader("📅 Session Breakdown")
+    session_data = []
+    for _, row in kpi_df.iterrows():
+        for s in row.get("sessions", []):
+            session_data.append({
+            "employee_id": row["employee_id"],
+            "session_id": s.get("session_id", "unknown"),
+            "session_duration_sec": s.get("session_duration_sec", 0),
+            "active_sec": s.get("active_sec", 0),
+            "idle_sec": s.get("idle_sec", 0),
+            "pause_min": s.get("pause_min", 0)
+            })
+
+    if session_data:
+        sess_df = pd.DataFrame(session_data)
+        sess_df["pause_sec"] = sess_df["pause_min"] * 60
+
+        # Stacked bar chart
+        melted = pd.melt(sess_df,
+                         id_vars=["employee_id", "session_id"],
+                         value_vars=["active_sec", "idle_sec", "pause_sec"],
+                         var_name="state", value_name="seconds")
+        state_labels = {"active_sec": "Active", "idle_sec": "Idle", "pause_sec": "Pause"}
+        melted["state"] = melted["state"].map(state_labels)
+
+        fig = px.bar(melted, x="session_id", y="seconds",
+                     color="state", barmode="stack",
+                     facet_col="employee_id",
+                     title="Session Time Breakdown")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Session table
+        st.dataframe(sess_df[["employee_id", "session_id",
+                              "session_duration_sec", "active_sec", "idle_sec", "pause_min"]])
+
+
+
+def show_overview_tab(es_connector, selected_employees, start_date, end_date):
+    """Display overview tab with KPIs and trends"""
+    st.header("📌 Key Metrics")
+    
+    # Fetch daily reports data
+  
+def show_daily_reports_tab(es_connector, selected_employees, start_date, end_date):
+    """Display daily reports tab"""
+    st.header("📋 Daily Reports")
+    
+    daily_data = es_connector.query_daily_reports(selected_employees, start_date, end_date)
+    df = DataProcessor.process_daily_reports(daily_data)
+    
+    if df.empty:
+        st.warning("No daily reports found for the selected filters")
+        return
+    
+    # Employee selector for detailed view
+    if len(selected_employees) > 1:
+        selected_employee = st.selectbox("Select employee for detailed view:", selected_employees)
+        filtered_df = df[df['employee_id'] == selected_employee]
+    else:
+        filtered_df = df
+    
+    # Display daily summaries
+    st.subheader("📝 Daily Summaries")
+    for _, row in filtered_df.iterrows():
+        with st.expander(f"{row['employee_id']} - {row['date']}"):
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.write("**Summary:**")
+                st.write(row['daily_summary'] or "No summary available")
+            
+            with col2:
+                st.metric("Productivity Score", f"{row['productivity_score']:.2f}")
+                st.metric("Active Time", f"{row['total_active_minutes']:.0f} min")
+                st.metric("Focus Level", f"{row['focus_level']:.2f}")
+    
+    # Display data table
+    st.subheader("📊 Data Table")
+    display_df = filtered_df[['employee_id', 'date', 'productivity_score', 'focus_level', 
+                             'total_active_minutes', 'deep_work_percentage']].round(2)
+    st.dataframe(display_df, use_container_width=True)
+
+def show_work_distribution_tab(es_connector, selected_employees, start_date, end_date):
+    """Display work distribution tab"""
+    st.header("🥧 Work Distribution")
+    
+    daily_data = es_connector.query_daily_reports(selected_employees, start_date, end_date)
+    df = DataProcessor.process_daily_reports(daily_data)
+    
+    if df.empty:
+        st.warning("No work distribution data found for the selected filters")
+        return
+    
+    # Aggregate work distribution
+    work_dist = DataProcessor.aggregate_work_distribution(df)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Average Work Distribution")
+        ChartGenerator.create_work_distribution_pie(work_dist)
+    
+    with col2:
+        st.subheader("Distribution by Percentage")
+        if work_dist:
+            dist_df = pd.DataFrame(list(work_dist.items()), columns=['Activity', 'Percentage'])
+            dist_df = dist_df.sort_values('Percentage', ascending=False)
+            st.dataframe(dist_df.round(2))
+        
+        st.subheader("📈 Work Pattern Insights")
+        if work_dist:
+            top_activity = max(work_dist, key=work_dist.get)
+            st.success(f"🏆 **Primary Activity:** {top_activity} ({work_dist[top_activity]:.1f}%)")
+            
+            if len(work_dist) > 1:
+                sorted_activities = sorted(work_dist.items(), key=lambda x: x[1], reverse=True)
+                st.info(f"📊 **Activity Breakdown:** " + 
+                       ", ".join([f"{act}: {pct:.1f}%" for act, pct in sorted_activities[:3]]))
+
+
 
 if __name__ == "__main__":
-    dashboard_page()
+    main()

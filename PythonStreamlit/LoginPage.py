@@ -19,6 +19,7 @@ def login_page():
             st.session_state.logged_in = True
             st.session_state.username = username
             st.session_state.role = user.get("role", "cloud_user")
+            st.session_state.employee_id = user.get("employee_id")  # Employee ID for filtering data
             st.success("✅ Login successful!")
             st.rerun()
         else:

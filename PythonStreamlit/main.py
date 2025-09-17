@@ -1,10 +1,21 @@
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent.resolve()))
 import streamlit as st
-from DashboardH import dashboard_page
-#from Cloud_AI_Assistant import chat_assistant_page
-from Task_Assitant import Task_assitant
+#from DashboardHmerged import dashboard_page
+#from DashboardH import dashboard_page2
+from Dashboard import main
+
+from Cloud_AI_Assistant import chat_assistant_page
+from Task_Assitant import Task_Assistant
 from LoginPage import login_page
 from admin_panel import admin_panel
 from password_page import set_password_page
+from MyActivity import show_my_activity_page  # or Dashboard if you put it there
+from MyActivity2 import show_my_activity_page2  # or Dashboard if you put it there
+
+from EmployeeRequests import show_admin_modifications_page
 #from DashboardHawelwehed.py import dashboard_page
 import traceback
 
@@ -47,18 +58,33 @@ with st.sidebar:
 # --- Navigation dictionary ---
 pages = {
     "📊 Dashboard": {
-        "func": dashboard_page,
+        "func": main,
         "desc": "View overall activity metrics and charts",
         "roles": ["admin", "user"]
     },
     "📋 Task Assigner": {
-        "func": Task_assitant,
+        "func": Task_Assistant,
         "desc": "Assign and track tasks",
         "roles": ["admin"]
     },
     "🤖 Chat Assistant": {
-        #"func": chat_assistant_page,
+        "func": chat_assistant_page,
         "desc": "Interact with AI assistant for help and insights",
+        "roles": ["admin", "user"]
+    },
+        "🛠️ Employee Requests ": {
+        "func": show_admin_modifications_page,
+        "desc": "Correct Employees activities",
+        "roles": ["admin"]
+    },
+    "👤 My Activity & Data Correction": {
+        "func": show_my_activity_page,
+        "desc": "track and correct your activity",
+        "roles": ["admin", "user"]
+    },
+        "👤 My Activity & Data Correction2": {
+        "func": show_my_activity_page2,
+        "desc": "track and correct your activity",
         "roles": ["admin", "user"]
     },
     "🔧 Admin Panel": {

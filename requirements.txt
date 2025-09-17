@@ -1,0 +1,28 @@
+# Core
+streamlit
+pandas
+plotly
+
+# Elasticsearch client
+pip install elasticsearch==8.9.0
+
+# RAG + LLM
+langchain
+langchain-community
+langchain-core
+chromadb
+
+# HuggingFace
+transformers
+accelerate
+torch
+numpy
+
+pynput
+pyperclip
+psutil
+uiautomation
+pillow  
+pystray
+  
+BeautifulSoup4

@@ -1,39 +1,53 @@
-"""
-import chromadb
+# retriever.py
 from sentence_transformers import SentenceTransformer
+from elasticsearch import Elasticsearch
 from .prompt_builder import build_prompt
 import subprocess
-import json
+
+# ---------- Config ----------
+ES_URL = "http://localhost:9200"
+INDEX_NAME = "html_chunks"
+EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+# ----------------------------
+
+# Connect to Elasticsearch
+es = Elasticsearch(ES_URL)
 
 # Load embedding model
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# Connect to Chroma
-client = chromadb.PersistentClient(path="chroma_db")
-collection = client.get_collection("html_chunks")
+model = SentenceTransformer(EMBEDDING_MODEL)
 
 def query_llm(prompt: str) -> str:
     result = subprocess.run(
-        ["ollama", "run", "gemma:2b"],
+        ["ollama", "run", "llama3.2:latest"],
         input=prompt,
         capture_output=True,
         text=True
     )
     return result.stdout.strip()
 
-def retrieve_and_answer(user_query: str, n_results=5) -> str:
-    query_embedding = model.encode([user_query])
+def retrieve_and_answer(user_query: str, n_results=5):
+    # Encode the query into a vector
+    query_vector = model.encode([user_query])[0].tolist()
 
-    results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=n_results
+    # Script_score search for cosine similarity
+    response = es.search(
+        index=INDEX_NAME,
+        body={
+            "size": n_results,
+            "query": {
+                "script_score": {
+                    "query": {"match_all": {}},
+                    "script": {
+                        "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
+                        "params": {"query_vector": query_vector}
+                    }
+                }
+            },
+            "_source": ["chunk_id", "title", "filepath", "content"]
+        }
     )
-    context_chunks = results["documents"][0]
 
-    # Build final prompt
+    context_chunks = [hit["_source"]["content"] for hit in response["hits"]["hits"]]
+
     final_prompt = build_prompt(context_chunks, user_query)
-
-    # Query Ollama LLM
-    answer = query_llm(final_prompt)
-    return answer
-"""
+    return query_llm(final_prompt)

@@ -54,5 +54,29 @@ def retry_local_buffer():
 
     local_retry_buffer = still_failed
 
-# You can call retry_local_buffer() periodically or at app start to drain stored events
+# Yhearbeat sender
+def _send_heartbeat(interval: int = 300):
+    """
+    Periodically send heartbeat events every `interval` seconds.
+    Runs in a background thread.
+    """
+    while True:
+        event = {
+            "timestamp": datetime.now().isoformat(),
+            "event": "heartbeat",
+            "employee_id": config.HOSTNAME,  # reuse existing identifier
+            "status": "alive"
+        }
+        log_event(event)
+        logger.info(f"Heartbeat sent: {event}")
+        time.sleep(interval)
+
+
+def start_heartbeat(interval: int = 300):
+    """
+    Launch heartbeat thread (non-blocking).
+    """
+    hb_thread = threading.Thread(target=_send_heartbeat, args=(interval,), daemon=True)
+    hb_thread.start()
+    logger.info("Heartbeat thread started.")
 

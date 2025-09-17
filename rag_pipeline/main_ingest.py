@@ -1,7 +1,7 @@
 from ingest import find_all_html_files, is_content_page, extract_content
 import json
 
-ROOT_DIR = "C:\\Users\\g50047910\\Downloads\\Huawei Cloud Stack 8.3.1 Product Documentation 05\\Huawei Cloud Stack_8.3.1_05_en_YEN0426D\\resources"
+ROOT_DIR = "/root/Huawei Cloud Stack_8.3.1_05_en_YEN0426D/resources"
 
 html_files = find_all_html_files(ROOT_DIR)
 

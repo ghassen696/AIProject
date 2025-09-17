@@ -2,6 +2,8 @@ import streamlit as st
 from auth import get_all_users, update_user, delete_user, check_password_strength
 from user_management import invite_user, send_invite_email
 import re 
+from auth import get_employee_ids
+
 
 # Enhanced CSS styling for better visual appeal
 def inject_css():
@@ -404,14 +406,9 @@ def render_edit_form(user, start_idx):
             st.info("🔒 Admin user employee ID cannot be changed")
             new_employee_id = user.get('employee_id', 'N/A')
         else:
-            if "employee_ids" not in st.session_state:
-                try:
-                    from PythonStreamlit.DashboardH2 import get_unique_terms
-                    st.session_state["employee_ids"] = get_unique_terms("employee_activity", "employee_id")
-                except:
-                    st.session_state["employee_ids"] = []
-
-            employee_ids = st.session_state.get("employee_ids", [])
+            employee_ids = get_employee_ids()
+            
+            st.session_state["employee_ids"] = employee_ids
             if employee_ids:
                 new_employee_id = st.selectbox(
                     "Employee ID",
@@ -485,7 +482,8 @@ def render_invite_form():
             )
         
         with col2:
-            employee_ids = st.session_state.get("employee_ids", [])
+            employee_ids = get_employee_ids()
+            st.session_state["employee_ids"] = employee_ids
             if employee_ids:
                 employee_id = st.selectbox(
                     "🆔 Employee ID",

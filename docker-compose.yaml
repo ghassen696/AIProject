@@ -1,4 +1,4 @@
-version: '3.8'
+#version: '3.8'
 
 services:
 
@@ -21,9 +21,10 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Kafka listens internally and externally
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      #KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://11.247.150.75:9092
+      # What clients will use to connect (your VM’s IP, not localhost!)
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://193.95.30.190:9092      
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
@@ -35,11 +36,12 @@ services:
       - monitoring-net
 
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
     container_name: elasticsearch
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
       - "9200:9200"

@@ -45,7 +45,28 @@ def user_exists(username: str) -> bool:
 
 def email_exists(email: str) -> bool:
     return get_user_doc_by_email(email) is not None
-
+#-----------------------------------------------------------------------
+def get_employee_ids(index: str = "employee_activity") -> list:
+    """
+    Fetch unique employee IDs from the employee_activity index.
+    """
+    body = {
+        "size": 0,
+        "aggs": {
+            "unique_ids": {
+                "terms": {
+                    "field": "employee_id",
+                    "size": 1000  # increase if you have many employees
+                }
+            }
+        }
+    }
+    try:
+        res = es.search(index=index, body=body)
+        return [bucket["key"] for bucket in res["aggregations"]["unique_ids"]["buckets"]]
+    except Exception as e:
+        logger.error(f"Error fetching employee IDs: {e}")
+        return []
 # ------------------------- CRUD Operations -------------------------
 
 def create_user(username: str, password: str, role: str = "user", employee_id: str = None, email: str = None, token: str = None, token_expiry_minutes: int = 120):
@@ -158,7 +179,7 @@ def delete_user(username):
 
         logger.error(f"Error deleting user {username}: {e}")
         return False
-def get_employee_logs(employee_id, date, index="employee-activity-logs"):
+def get_employee_logs(employee_id, date, index="employee_activity"):
     """
     Fetch logs for a given employee on a specific date.
     """

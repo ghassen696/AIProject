@@ -1,68 +1,75 @@
+# embedder.py
 import json
-import chromadb
 from sentence_transformers import SentenceTransformer
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
 from tqdm import tqdm
 
 # ---------- Config ----------
-CHROMA_DB_PATH = "chroma_db"
-COLLECTION_NAME = "html_chunks"
+ES_URL = "http://localhost:9200"
+INDEX_NAME = "html_chunks"
 CHUNKS_JSON_PATH = "chunked_docs.json"
-BATCH_SIZE = 5000
+BATCH_SIZE = 500
+EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 # ----------------------------
+
+es = Elasticsearch(ES_URL, verify_certs=False)
+
+# Create index with vector mapping
+from elasticsearch import Elasticsearch, exceptions
+
+es = Elasticsearch(ES_URL, verify_certs=False)
+
+# Try to create index, ignore if it already exists
+try:
+    es.indices.create(
+        index=INDEX_NAME,
+        mappings={
+            "properties": {
+                "chunk_id": {"type": "keyword"},
+                "title": {"type": "text"},
+                "filepath": {"type": "keyword"},
+                "content": {"type": "text"},
+                "embedding": {
+                    "type": "dense_vector",
+                    "dims": 768,
+                    "index": True,
+                    "similarity": "cosine"
+                }
+            }
+        }
+    )
+    print(f"🆕 Index '{INDEX_NAME}' created.")
+except exceptions.RequestError as e:
+    if "resource_already_exists_exception" in str(e.info):
+        print(f"✅ Index '{INDEX_NAME}' already exists.")
+    else:
+        raise
+
 
 # Load JSON chunks
 with open(CHUNKS_JSON_PATH, "r", encoding="utf-8") as f:
     docs = json.load(f)
 
-# Prepare texts, IDs, metadata
-texts = [doc["content"] for doc in docs]
-ids = [doc["chunk_id"] for doc in docs]
-metadatas = [{"title": doc["title"], "filepath": doc["filepath"]} for doc in docs]
+model = SentenceTransformer(EMBEDDING_MODEL)
 
-# Initialize Chroma
-client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-try:
-    collection = client.get_collection(name=COLLECTION_NAME)
-    print(f"✅ Collection '{COLLECTION_NAME}' loaded.")
-except:
-    collection = client.create_collection(name=COLLECTION_NAME)
-    print(f"🆕 Collection '{COLLECTION_NAME}' created.")
+# Index in batches using bulk API
+for i in tqdm(range(0, len(docs), BATCH_SIZE), desc="🔢 Indexing Batches"):
+    batch = docs[i:i+BATCH_SIZE]
+    actions = []
+    for doc in batch:
+        embedding = model.encode(doc["content"]).tolist()
+        actions.append({
+            "_index": INDEX_NAME,
+            "_id": doc["chunk_id"],
+            "_source": {
+                "chunk_id": doc["chunk_id"],
+                "title": doc["title"],
+                "filepath": doc["filepath"],
+                "content": doc["content"],
+                "embedding": embedding
+            }
+        })
+    bulk(es, actions)
 
-# Get existing chunk IDs (to skip duplicates)
-existing_ids = set()
-try:
-    existing_docs = collection.get(ids=None, limit=1_000_000)
-    existing_ids = set(existing_docs["ids"])
-    print(f"📦 Found {len(existing_ids)} existing chunks.")
-except Exception as e:
-    print("⚠️ Could not load existing IDs (collection may be empty).")
-
-# Filter new chunks
-new_texts, new_ids, new_metadatas = [], [], []
-for text, id_, meta in zip(texts, ids, metadatas):
-    if id_ not in existing_ids:
-        new_texts.append(text)
-        new_ids.append(id_)
-        new_metadatas.append(meta)
-
-print(f"🔍 {len(new_ids)} new chunks to embed (skipped {len(texts) - len(new_ids)} existing).")
-
-# Load embedding model
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# Batch insert new embeddings
-for i in tqdm(range(0, len(new_texts), BATCH_SIZE), desc="🔢 Embedding Batches"):
-    batch_texts = new_texts[i:i+BATCH_SIZE]
-    batch_ids = new_ids[i:i+BATCH_SIZE]
-    batch_metadatas = new_metadatas[i:i+BATCH_SIZE]
-
-    embeddings = model.encode(batch_texts, show_progress_bar=False, batch_size=32)
-
-    collection.add(
-        documents=batch_texts,
-        embeddings=embeddings,
-        metadatas=batch_metadatas,
-        ids=batch_ids
-    )
-
-print("✅ All new chunks embedded and stored in ChromaDB.")
+print(f"✅ Indexed {len(docs)} chunks into Elasticsearch.")
